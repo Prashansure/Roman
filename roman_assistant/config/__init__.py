@@ -1,0 +1,1 @@
+"""ROMAN Ⅰ application configuration."""
