@@ -1,1 +1,1 @@
-"""ROMAN Ⅰ desktop interface."""
+"""Roman desktop interface."""

@@ -1,0 +1,7 @@
+/roman_assistant/.venv/
+/roman_assistant/memory/*.json
+/roman_assistant/memory/conversations/
+/roman_assistant/config/roman_ui_preferences.json
+**/__pycache__/
+**/*.py[cod]
+/.roman_phase2_backup/

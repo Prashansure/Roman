@@ -6,12 +6,23 @@ import wave
 from pathlib import Path
 from typing import Callable
 
-from config.settings import (
-    MIC_CHANNELS,
-    MIC_DEVICE_INDEX,
-    MIC_FRAMES_PER_BUFFER,
-    MIC_RATE,
-)
+from config import settings as app_settings
+
+
+def list_input_devices() -> list[tuple[int, str]]:
+    """List available audio inputs for the functional voice settings panel."""
+    import pyaudio
+
+    audio = pyaudio.PyAudio()
+    try:
+        devices = []
+        for index in range(audio.get_device_count()):
+            info = audio.get_device_info_by_index(index)
+            if int(info.get("maxInputChannels", 0)) > 0:
+                devices.append((index, str(info.get("name", f"Input {index}"))))
+        return devices
+    finally:
+        audio.terminate()
 
 
 class Microphone:
@@ -38,29 +49,26 @@ class Microphone:
     def _record(self, on_stopped) -> None:
         path = None
         error = None
+        stream = None
         try:
             stream = self._audio.open(
                 format=self._pyaudio.paInt16,
-                channels=MIC_CHANNELS,
-                rate=MIC_RATE,
+                channels=app_settings.MIC_CHANNELS,
+                rate=app_settings.MIC_RATE,
                 input=True,
-                input_device_index=MIC_DEVICE_INDEX,
-                frames_per_buffer=MIC_FRAMES_PER_BUFFER,
+                input_device_index=app_settings.MIC_DEVICE_INDEX,
+                frames_per_buffer=app_settings.MIC_FRAMES_PER_BUFFER,
             )
             with self._lock:
                 self._stream = stream
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp:
                 path = Path(temp.name)
             with wave.open(str(path), "wb") as wav:
-                wav.setnchannels(MIC_CHANNELS)
+                wav.setnchannels(app_settings.MIC_CHANNELS)
                 wav.setsampwidth(self._audio.get_sample_size(self._pyaudio.paInt16))
-                wav.setframerate(MIC_RATE)
+                wav.setframerate(app_settings.MIC_RATE)
                 while not self._stop.is_set():
-                    wav.writeframes(stream.read(MIC_FRAMES_PER_BUFFER, exception_on_overflow=False))
-            stream.stop_stream()
-            stream.close()
-            with self._lock:
-                self._stream = None
+                    wav.writeframes(stream.read(app_settings.MIC_FRAMES_PER_BUFFER, exception_on_overflow=False))
             if path.stat().st_size <= 44:
                 path.unlink(missing_ok=True)
                 path = None
@@ -70,21 +78,46 @@ class Microphone:
                 path.unlink(missing_ok=True)
                 path = None
         finally:
-            on_stopped(path, error)
+            if stream is not None:
+                try:
+                    stream.stop_stream()
+                except Exception:
+                    pass
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            with self._lock:
+                self._stream = None
+            try:
+                self._audio.terminate()
+            except Exception:
+                pass
+            if error and path:
+                path.unlink(missing_ok=True)
+                path = None
+            try:
+                on_stopped(path, error)
+            except Exception:
+                if path:
+                    path.unlink(missing_ok=True)
+                raise
 
     def stop(self) -> None:
         self._stop.set()
 
-    def close(self) -> None:
+    def close(self, timeout: float = 1.0) -> None:
         self.stop()
         with self._lock:
             stream = self._stream
         if stream is not None:
             try:
-                stream.stop_stream()
                 stream.close()
             except Exception:
                 pass
+        thread = self._thread
+        if thread and thread is not threading.current_thread():
+            thread.join(timeout=max(0.0, timeout))
         try:
             self._audio.terminate()
         except Exception:

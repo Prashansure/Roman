@@ -1,3 +1,7 @@
 faster-whisper>=1.0.0
 ollama>=0.3.0
 PyAudio>=0.2.14
+Pillow>=10.0.0
+# CUDA 12 runtime libraries used by CTranslate2/Faster-Whisper on Windows.
+nvidia-cublas-cu12>=12,<13
+nvidia-cudnn-cu12>=9,<10

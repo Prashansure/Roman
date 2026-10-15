@@ -1,1 +1,1 @@
-"""ROMAN Ⅰ application configuration."""
+"""Roman application configuration."""
