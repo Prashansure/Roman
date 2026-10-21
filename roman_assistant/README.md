@@ -6,9 +6,22 @@ Roman is a desktop assistant built from the supplied prototype. It keeps the ori
 
 ## Run
 
-1. Install Python 3.10 or 3.11 and the dependencies in `requirements.txt`.
-2. Make sure Ollama is running and has `llama3.2:3b` available. On Windows, the source prototype expects the microphone input device at index 1.
-3. From this directory, run `python main.py`.
+1. Use Python 3.10 or 3.11, and install dependencies into the same Python that `python` selects: `python -m pip install -r requirements.txt`.
+2. Check that Ollama is running and the configured model is installed:
+
+   ```powershell
+   ollama list
+   ```
+
+   Confirm that `llama3.2:3b` appears in the list. This checks the Ollama service and models; it does not check that Roman's Python environment has the Ollama client.
+3. Check Roman's Python client, then start Roman with the same Python command:
+
+   ```powershell
+   python -c "import ollama; print('Ollama Python client OK')"
+   python main.py
+   ```
+
+   If the import check fails, install the requirements with `python -m pip install -r requirements.txt` before starting Roman. On Windows, the source prototype expects the microphone input device at index 1.
 
 The Whisper model loads when the first recording is transcribed. CUDA is used when available, with a CPU `int8` fallback.
 

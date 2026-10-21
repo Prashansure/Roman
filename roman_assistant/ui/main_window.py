@@ -65,17 +65,17 @@ class RoundedBubble(tk.Canvas):
     def __init__(self, parent, fill: str) -> None:
         super().__init__(parent, bg=BG, highlightthickness=0, borderwidth=0, width=240, height=58)
         self.fill = fill
-        self.panel = tk.Frame(self, bg=fill, padx=13, pady=9)
+        self.panel = tk.Frame(self, bg=fill, padx=12, pady=6)
         self.window = self.create_window((7, 7), window=self.panel, anchor="nw")
         self.panel.bind("<Configure>", self._sync_size)
         self.bind("<Configure>", self._draw)
 
     def _sync_size(self, _event=None) -> None:
-        width = max(88, self.panel.winfo_reqwidth() + 32)
-        height = max(48, self.panel.winfo_reqheight() + 32)
+        width = max(88, self.panel.winfo_reqwidth() + 16)
+        height = max(48, self.panel.winfo_reqheight() + 16)
         self.configure(width=width, height=height)
-        self.coords(self.window, 16, 16)
-        self.itemconfigure(self.window, width=width - 32, height=height - 32)
+        self.coords(self.window, 8, 8)
+        self.itemconfigure(self.window, width=width - 16, height=height - 16)
         self._draw()
 
     def _draw(self, _event=None) -> None:
@@ -909,10 +909,10 @@ class RomanWindow:
         role = item["role"]
         lane_width = min(MAX_LANE, max(320, self.chat_canvas.winfo_width() - 72))
         row = tk.Frame(self.message_column, bg=BG)
-        row.pack(fill="x", padx=12, pady=(9, 13), before=before)
+        row.pack(fill="x", padx=12, pady=(4, 8), before=before)
         content = tk.Frame(row, bg=BG, width=lane_width)
         content.pack(side="right" if role == "user" else "top", anchor="e" if role == "user" else "center")
-        content.pack_propagate(False)
+        content.pack_propagate(True)
         chars = self._body_chars()
         text_size = self._text_size()
 
@@ -926,6 +926,7 @@ class RomanWindow:
                 spacing1=2, spacing3=3, state="normal",
             )
             text.pack()
+            text.bind("<Configure>", lambda event, widget=text: self._on_text_configure(widget, event))
             self._set_plain_text(text, item["text"], editable=True)
             text.configure(state="disabled")
         elif role == "system":
@@ -978,13 +979,27 @@ class RomanWindow:
             item["main_frame"].configure(height=widget.winfo_reqheight() + 8)
             return
         try:
-            count = widget.count("1.0", "end-1c", "ypixels")
-            pixels = count[0] if count else widget.winfo_reqheight()
+            # RoundedBubble sizes its embedded panel after Tk processes geometry.
+            # Measuring at the initial 1px width counts every character as a line.
+            if widget.winfo_width() <= 1:
+                return
+            count = widget.count("1.0", "end-1c", "displaylines")
+            display_lines = count[0] if count else 0
+            lines = max(1, display_lines + (1 if item.get("role") == "user" else 0))
             line_height = max(1, tkfont.Font(font=widget.cget("font")).metrics("linespace"))
-            lines = max(1, math.ceil(pixels / line_height))
-            widget.configure(height=max(1, lines))
-            requested = widget.winfo_reqheight() + 32
-            item["main_frame"].configure(height=max(requested, 56))
+            embedded_extra = 0
+            for child_name in widget.window_names():
+                try:
+                    child = widget.nametowidget(child_name)
+                    embedded_extra += max(0, math.ceil(child.winfo_reqheight() / line_height) - 1)
+                except (KeyError, tk.TclError):
+                    continue
+            widget.configure(height=lines + embedded_extra)
+            if item.get("role") == "user":
+                # The Canvas window has a fixed height until it is explicitly
+                # synchronized with the Text widget's updated requested size.
+                bubble = widget.master.master
+                self.root.after_idle(bubble._sync_size)
         except tk.TclError:
             return
 

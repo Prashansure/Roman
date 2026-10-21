@@ -11,7 +11,11 @@ from typing import Callable
 from audio.microphone import Microphone
 from audio.whisper import Transcriber
 from core.state import AssistantState, EventBus
+from config.settings import APP_NAME
 from llm.ollama_client import OllamaClient
+from memory.backend_adapter import MemoryBackendAdapter, MemoryBackendError
+from memory.commands import MemoryCommandProcessor
+from memory.identity import extract_explicit_user_name, filter_identity_extraction, identity_response
 from memory.memory_manager import MemoryManager
 from speech.tts import Speech
 
@@ -21,18 +25,38 @@ logger = logging.getLogger(__name__)
 class Assistant:
     def __init__(
         self,
-        memory: MemoryManager | None = None,
+        memory: MemoryManager | MemoryBackendAdapter | None = None,
         llm: OllamaClient | None = None,
         transcriber: Transcriber | None = None,
         speech: Speech | None = None,
         microphone_factory: Callable[[], Microphone] = Microphone,
         shutdown_timeout: float = 3.0,
+        memory_backend: str | None = None,
+        memory_root: Path | None = None,
+        sqlite_path: Path | str | None = None,
     ) -> None:
         self.events = EventBus()
         self.microphone: Microphone | None = None
         self.transcriber = transcriber or Transcriber()
         self.llm = llm or OllamaClient()
-        self.memory = memory or MemoryManager()
+        if memory is not None:
+            self.memory = memory
+        else:
+            try:
+                self.memory = MemoryBackendAdapter(
+                    root=memory_root,
+                    backend_name=memory_backend,
+                    sqlite_path=sqlite_path,
+                )
+            except MemoryBackendError:
+                raise
+            except Exception as exc:
+                raise MemoryBackendError(f"Configured memory backend could not start: {exc}") from exc
+        self._memory_commands = (
+            MemoryCommandProcessor(self.memory)
+            if isinstance(self.memory, MemoryBackendAdapter)
+            else None
+        )
         self.speech = speech or Speech()
         self._microphone_factory = microphone_factory
         self._lock = threading.RLock()
@@ -170,6 +194,9 @@ class Assistant:
                 self.events.publish("log", "No clear speech detected. Try again when ready.")
                 self._state_to(AssistantState.ONLINE, "Ready")
                 return
+            command_status = self._handle_memory_command(query, allow_reserved=True)
+            if command_status is not None:
+                return
             if not self.memory.add_user_message(query, session_id):
                 message = "Could not save the transcribed message to conversation history."
                 self.events.publish("log", message, True)
@@ -192,6 +219,9 @@ class Assistant:
         query = query.strip()
         if not query:
             return False
+        command_status = self._handle_memory_command(query)
+        if command_status is not None:
+            return command_status
         with self._lock:
             if self._closed or self._processing or self._listening:
                 accepted = False
@@ -222,6 +252,58 @@ class Assistant:
             self.events.publish("log", "Could not start the assistant response worker.", True)
         return True
 
+    def _handle_memory_command(self, query: str, *, allow_reserved: bool = False) -> bool | None:
+        """Handle an exact local memory command without invoking Ollama."""
+
+        if self._memory_commands is None:
+            return None
+        if not query.lstrip().startswith(("/remember", "/memory", "/forget")):
+            return None
+        with self._lock:
+            if self._closed or (not allow_reserved and (self._processing or self._listening)):
+                return False
+            try:
+                result = self._memory_commands.handle(query)
+            except Exception as exc:
+                logger.exception("Memory command failed")
+                result = None
+                error = f"Memory command failed: {exc}"
+            else:
+                error = ""
+        if result is None:
+            response = error
+        elif not result.handled:
+            return None
+        else:
+            response = result.response
+        self.events.publish("message", "You", query)
+        self.events.publish("generation_start")
+        self.events.publish("generation_end", response or "Memory command completed.", True)
+        return True
+
+    def _prepare_prompt(self, query: str, history: list[dict[str, str]]) -> tuple[list[dict[str, str]], str]:
+        """Prepare bounded context when the adapter is active.
+
+        Legacy injected MemoryManager instances retain their existing prompt
+        behavior.  Adapter retrieval errors are non-fatal: Ollama proceeds
+        without long-term context and the user receives a clear notice.
+        """
+
+        prepare = getattr(self.memory, "prepare_prompt", None)
+        if callable(prepare):
+            prepared = prepare(query, history=history, cancel_event=self._cancel_requested)
+            retrieval = getattr(prepared, "retrieval", None)
+            error = getattr(retrieval, "error", None)
+            if error:
+                self.events.publish("log", f"Memory retrieval unavailable; continuing without it: {error}", True)
+            return list(prepared.history), prepared.memory_context
+        try:
+            return history, self.memory.memory_for_prompt()
+        except Exception as exc:
+            logger.exception("Legacy memory retrieval failed")
+            self.events.publish("log", f"Memory retrieval unavailable; continuing without it: {exc}", True)
+            return history, ""
+
     def _answer(
         self,
         query: str,
@@ -245,6 +327,12 @@ class Assistant:
             session_id = session_id or self._ensure_session()
             if self._cancel_requested.is_set() or self._closed:
                 return
+            explicit_name = extract_explicit_user_name(query)
+            remember_name = getattr(self.memory, "remember_user_name", None)
+            if explicit_name and callable(remember_name):
+                mutation = remember_name(explicit_name)
+                if mutation.action == "error":
+                    logger.error("Could not save explicitly stated user name: %s", mutation.error)
             if not user_saved:
                 if not self.memory.add_user_message(query, session_id):
                     message = "Could not save your message to conversation history; it was not sent."
@@ -256,19 +344,34 @@ class Assistant:
             self._state_to(AssistantState.THINKING, "Thinking…")
             self.events.publish("generation_start")
             generation_started = True
-            history = list(self.memory.recent_history)
-            if history and history[-1] == {"role": "user", "content": query}:
-                history.pop()
-            for token in self.llm.stream(
-                query,
-                history=history,
-                memory=self.memory.memory_for_prompt(),
-                cancel_event=self._cancel_requested,
-            ):
+            stored_memory = getattr(self.memory, "memory", {})
+            user_profile = stored_memory.get("user", {}) if isinstance(stored_memory, dict) else {}
+            user_name = user_profile.get("name") if isinstance(user_profile, dict) else None
+            answer = identity_response(query, user_name=user_name, assistant_name=APP_NAME)
+            if answer is not None:
+                # Keep identity answers grounded in the configured assistant name
+                # and the single authoritative user profile fact.
+                parts.append(answer)
+                self.events.publish("generation_token", answer)
+            else:
+                history = list(self.memory.recent_history)
+                if history and history[-1] == {"role": "user", "content": query}:
+                    history.pop()
+                history, memory_context = self._prepare_prompt(query, history)
                 if self._cancel_requested.is_set() or self._closed:
-                    break
-                parts.append(token)
-                self.events.publish("generation_token", token)
+                    self.events.publish("generation_end", "", False)
+                    generation_ended = True
+                    return
+                for token in self.llm.stream(
+                    query,
+                    history=history,
+                    memory=memory_context,
+                    cancel_event=self._cancel_requested,
+                ):
+                    if self._cancel_requested.is_set() or self._closed:
+                        break
+                    parts.append(token)
+                    self.events.publish("generation_token", token)
 
             answer = "".join(parts).strip()
             if self._cancel_requested.is_set() or self._closed:
@@ -290,13 +393,15 @@ class Assistant:
             else:
                 self.events.publish("log", "Response generated but could not be saved to history.", True)
 
-            try:
-                extraction = self.llm.extract_memories(query, answer)
-                self.memory.update_memories(extraction)
-            except Exception:
-                if not self._cancel_requested.is_set() and not self._closed:
-                    logger.exception("Memory extraction failed")
-                    self.events.publish("log", "Memory update failed; the conversation remains saved.")
+            if identity_response(query, user_name=user_name, assistant_name=APP_NAME) is None:
+                try:
+                    extraction = self.llm.extract_memories(query, answer)
+                    extraction = filter_identity_extraction(extraction)
+                    self.memory.update_memories(extraction)
+                except Exception:
+                    if not self._cancel_requested.is_set() and not self._closed:
+                        logger.exception("Memory extraction failed")
+                        self.events.publish("log", "Memory update failed; the conversation remains saved.")
 
             if self._cancel_requested.is_set() or self._closed:
                 return
@@ -405,3 +510,9 @@ class Assistant:
             self.llm.close()
         except Exception:
             logger.exception("Failed to release the Ollama client during shutdown")
+        try:
+            close_memory = getattr(self.memory, "close", None)
+            if callable(close_memory):
+                close_memory()
+        except Exception:
+            logger.exception("Failed to close the memory backend during shutdown")

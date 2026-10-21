@@ -10,6 +10,23 @@ MIN_WINDOW_SIZE = (860, 600)
 BASE_DIR = Path(__file__).resolve().parents[1]
 ASSETS_DIR = BASE_DIR / "assets"
 
+# The JSON backend remains the active default.  The SQLite path is only a
+# configuration target for explicit prototype/testing selection; merely
+# importing settings or constructing the default adapter must not create it.
+MEMORY_BACKEND = "json"
+SQLITE_MEMORY_PATH = BASE_DIR / "memory" / "roman_memory.sqlite3"
+
+# Retrieval limits are deliberately character-based until the local model's
+# tokenizer is available here.  They bound prompt size without changing the
+# existing Ollama request format.
+MEMORY_MAX_FACTS = 8
+MEMORY_MAX_MESSAGES = 6
+MEMORY_MAX_RECENT_MESSAGES = 12
+MEMORY_MAX_FACT_CHARS = 500
+MEMORY_MAX_MESSAGE_CHARS = 1000
+MEMORY_MAX_CONTEXT_CHARS = 6000
+MEMORY_MAX_PROMPT_CHARS = 16000
+
 WHISPER_MODEL = "base"
 WHISPER_DEVICE = "cuda"
 WHISPER_COMPUTE_TYPE = "float16"
